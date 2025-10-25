@@ -54,7 +54,6 @@ struct backcmd {
 int fork1(void);  // Fork but panics on failure.
 void panic(char*);
 struct cmd *parsecmd(char*);
-static int needprompt = 1;
 
 // Execute cmd.  Never returns.
 void
@@ -134,106 +133,117 @@ runcmd(struct cmd *cmd)
     exit();
 }
 
-int
-getcmd(char *buf, int nbuf)
+void
+handle_tab_completion(char *buf, int *pos, int nbuf)
 {
-    if(needprompt){
-        printf(2, "$ ");
-    }
-    memset(buf, 0, nbuf);
-    gets(buf, nbuf);
-    if(buf[0] == 0) // EOF
-        return -1;
-
-    // Tab completion: detect any '\t' in the buffer (console may have injected a newline already)
-    int len = strlen(buf);
-    if(len > 0 && buf[len-1] == '\n'){
-        buf[--len] = 0;
-    }
-    // find last tab position, if any
-    int tabpos = -1;
-    for(int i = 0; i < len; i++){
-        if(buf[i] == '\t') tabpos = i;
-    }
-    if(tabpos >= 0){
-        buf[tabpos] = 0; // cut at tab
-        // find prefix (up to first space)
-        char *p = buf;
-        while(*p && *p == ' ') p++;
-        char *end = p;
-        while(*end && *end != ' ' && *end != '\n') end++;
-        char saved = *end; *end = 0;
-
-        // scan directory "/" for binaries; user programs are installed at root
-        int fd = open("/", 0);
-        struct dirent de;
-        int matches = 0;
-        char best[DIRSIZ+1];
-        while(read(fd, &de, sizeof(de)) == sizeof(de)){
-            if(de.inum == 0) continue;
-            // skip non-matching prefix
-            int ok = 1;
-            for(int i=0; p[i]; i++){
-                if(i >= DIRSIZ) { ok = 0; break; }
-                if(de.name[i] != p[i]){ ok = 0; break; }
+    // Find the start of the current word
+    char *p = buf;
+    while(*p && *p == ' ') p++;
+    
+    // Save current position
+    int prefix_len = p - buf;
+    char *word_start = p;
+    while(*p && *p != ' ' && *p != '\n') p++;
+    
+    // Temporarily null-terminate the word
+    char saved = *p;
+    *p = 0;
+    
+    // Search for matching commands in root directory
+    int fd = open("/", 0);
+    struct dirent de;
+    int matches = 0;
+    char best[DIRSIZ+1];
+    char match_list[MAXARGS][DIRSIZ+1];
+    int match_count = 0;
+    
+    while(read(fd, &de, sizeof(de)) == sizeof(de)){
+        if(de.inum == 0) continue;
+        
+        // Check if this entry matches the prefix
+        int ok = 1;
+        for(int i = 0; word_start[i]; i++){
+            if(i >= DIRSIZ || de.name[i] != word_start[i]){
+                ok = 0;
+                break;
             }
-            if(!ok) continue;
-            // ensure it's a file (optional: stat)
+        }
+        
+        if(ok){
             if(matches == 0){
                 memset(best, 0, sizeof(best));
                 memmove(best, de.name, DIRSIZ);
-            } else {
-                // multiple -> we will list later
+            }
+            if(match_count < MAXARGS){
+                memset(match_list[match_count], 0, DIRSIZ+1);
+                memmove(match_list[match_count], de.name, DIRSIZ);
+                match_count++;
             }
             matches++;
         }
-        close(fd);
-        *end = saved;
-
-        if(matches == 1){
-            // complete the command name in-place
-            int full_len = 0; while(full_len < DIRSIZ && best[full_len]) full_len++;
-            // replace p with best and add trailing space
-            memmove(p, best, full_len);
-            p[full_len] = ' ';
-            p[full_len+1] = 0;
-            printf(2, "\r$ %s", buf);
-        } else if(matches > 1){
-            printf(1, "\n");
-            // list all matches
-            int fd2 = open("/", 0);
-            struct dirent de2;
-            while(read(fd2, &de2, sizeof(de2)) == sizeof(de2)){
-                if(de2.inum == 0) continue;
-                int ok = 1;
-                for(int i=0; p[i]; i++){
-                    if(i >= DIRSIZ) { ok = 0; break; }
-                    if(de2.name[i] != p[i]){ ok = 0; break; }
-                }
-                if(ok){
-                    char namebuf[DIRSIZ+1];
-                    memset(namebuf, 0, sizeof(namebuf));
-                    memmove(namebuf, de2.name, DIRSIZ);
-                    printf(1, "%s ", namebuf);
-                }
-            }
-            close(fd2);
-            printf(1, "\n");
-            printf(2, "$ %s", buf);
-        } else {
-            // no matches: just reprint prompt with current buffer
-            printf(2, "\r$ %s", buf);
-        }
-        // After handling Tab: keep completed buffer and add a newline so it can run on Enter
-        int blen = strlen(buf);
-        if(blen < nbuf-1){
-            buf[blen] = '\n';
-            buf[blen+1] = 0;
-        }
-        needprompt = 0; // we already printed the prompt for this line
-        return 0;
     }
-    needprompt = 1;
+    close(fd);
+    
+    *p = saved;
+    
+    if(matches == 1){
+        // Unique match - complete it
+        int best_len = 0;
+        while(best_len < DIRSIZ && best[best_len]) best_len++;
+        
+        // Clear the rest of the line
+        printf(2, "\r$ ");
+        for(int i = 0; i < *pos; i++) printf(2, " ");
+        printf(2, "\r$ ");
+        
+        // Rebuild buffer with completion
+        memmove(word_start, best, best_len);
+        word_start[best_len] = ' ';
+        *pos = prefix_len + best_len + 1;
+        buf[*pos] = 0;
+        printf(2, "%s", buf);
+    } else if(matches > 1){
+        // Multiple matches - list them
+        printf(2, "\n");
+        for(int i = 0; i < match_count; i++){
+            printf(2, "%s ", match_list[i]);
+        }
+        printf(2, "\n$ %s", buf);
+    }
+}
+
+int
+getcmd(char *buf, int nbuf)
+{
+    printf(2, "$ ");
+    memset(buf, 0, nbuf);
+    
+    int i = 0;
+    int cc;
+    char c;
+    
+    while(i < nbuf - 1){
+        cc = read(0, &c, 1);
+        if(cc < 1)
+            break;
+        
+        if(c == '\t'){
+            // Handle tab completion immediately
+            buf[i] = 0;
+            handle_tab_completion(buf, &i, nbuf);
+            continue;
+        }
+        
+        buf[i++] = c;
+        if(c == '\n' || c == '\r')
+            break;
+    }
+    
+    buf[i] = '\0';
+    
+    if(buf[0] == 0) // EOF
+        return -1;
+    
     return 0;
 }
 
@@ -253,10 +263,6 @@ main(void)
     
     // Read and run input commands.
     while(getcmd(buf, sizeof(buf)) >= 0){
-        if(buf[0] == 0){
-            // empty (e.g., after tab-completion handling); prompt again
-            continue;
-        }
         if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
             // Clumsy but will have to do for now.
             // Chdir has no effect on the parent if run in the child.
